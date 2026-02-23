@@ -215,6 +215,32 @@ EOF
       stopbits: $STOPBITS
       parity: $PARITY
 EOF
+    elif [ "$DEVICE_TYPE" = "udp" ]; then
+        PORT=$(bashio::config "modbus_devices[${DEVICE_COUNT}].port" "8899")
+        SET_CLIENT_ADDRESS=$(bashio::config "modbus_devices[${DEVICE_COUNT}].set_client_address" "")
+        SET_CLIENT_ADDRESS_RESPONSE=$(bashio::config "modbus_devices[${DEVICE_COUNT}].set_client_address_response" "")
+        TRANSFORM_SNIPPET=$(bashio::config "modbus_devices[${DEVICE_COUNT}].transform_snippet" "")
+
+        echo "✅ $NAME: UDP $HOST:$PORT -> :$BIND_PORT"
+
+        # Add UDP device to YAML configuration (write the block scalar header first)
+        cat >> "$CONFIG_PATH" <<EOF
+  - modbus:
+      url: udp://$HOST:$PORT
+      bind_port: $BIND_PORT
+      set_client_address: $SET_CLIENT_ADDRESS
+      set_client_address_response: $SET_CLIENT_ADDRESS_RESPONSE
+      transform_snippet: |
+EOF
+
+        # Append the transform snippet, preserving indentation for multiline Python code
+        if [ -n "$TRANSFORM_SNIPPET" ] && [ "$TRANSFORM_SNIPPET" != "null" ]; then
+            echo "$TRANSFORM_SNIPPET" | sed 's/^/        /' >> "$CONFIG_PATH"
+        else
+            # ensure there's at least an indented empty line for a valid YAML block
+            echo "        " >> "$CONFIG_PATH"
+        fi
+
     else
         echo "⚠️ Device #$((DEVICE_COUNT+1)) skipped – invalid protocol: $DEVICE_TYPE"
         DEVICE_COUNT=$((DEVICE_COUNT+1))

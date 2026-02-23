@@ -1148,7 +1148,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         async with self.server:
             device_info = (
                 f"Device({self.modbus_host}:{self.modbus_port})"
-                if self.modbus_type in ["tcp", "rtutcp"]
+                if self.modbus_type in ["tcp", "rtutcp", "udp"]
                 else f"Device({self.device})"
             )
             self.log.info(
