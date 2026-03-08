@@ -24,12 +24,12 @@ import ast
 import types
 import sys
 import traceback
-from string import Template
 
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"  # TODO remove
 
 # Changelog:
+# 2.3.1 - Minor bug fixes and improvements TODO remove
 # 2.3.0 - Added UDP mode
 # 0.8.5 - Normalize RTU device path: ensure absolute path and resolve symlinks
 # 0.8.4 - Fix RTU over TCP communication issue, improve format detection
@@ -616,6 +616,14 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             self.udp_set_addr_template = modbus.get("set_client_address")
             self.udp_set_addr_resp_template = modbus.get("set_client_address_response")
             self.udp_pre_timeout = modbus.get("set_client_timeout", self.timeout or 5)
+            # Determine a local address on the same network as the modbus host so
+            # remote UDP devices can send replies back to this address. Also
+            # capture the local port we'll bind so templates can use it.
+            # self.local_udp_bind_port = self.port
+            if bind.hostname:
+                self.local_udp_bind_address = bind.hostname
+            else:
+                self.local_udp_bind_address = None
         else:
             self.modbus_type = "tcp"
             super().__init__(f"ModBus({url.hostname}:{url.port})", None, None)
@@ -705,9 +713,34 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             # Create a UDP endpoint bound to the proxy listen address so device can reply to it
             loop = asyncio.get_running_loop()
 
+            self.log.info("udp connect A:")  #TODO remove
             class _UDPProtocol(asyncio.DatagramProtocol):
-                def __init__(self):
+                def __init__(self, parent_log):
                     self.queue = asyncio.Queue()
+                    self.return_addr = None
+                    self.log = parent_log
+
+                def connection_made(self, transport):
+                    self.transport = transport
+                    # Prefer the transport-provided sockname which is portable
+                    local = transport.get_extra_info("sockname")
+                    # peer may be available when socket is connected
+                    peer = transport.get_extra_info("peername")
+                    # underlying socket as a fallback
+                    sock = transport.get_extra_info("socket")
+                    if local:
+                        self.return_addr = local
+                    elif sock is not None:
+                        try:
+                            self.return_addr = sock.getsockname()
+                        except Exception:
+                            self.return_addr = None
+                    else:
+                        self.return_addr = None
+                    try:
+                        self.log.info("udp connect return addr: %s", self.return_addr)
+                    except Exception:
+                        pass
 
                 def datagram_received(self, data, addr):
                     try:
@@ -715,16 +748,35 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                     except Exception:
                         pass
 
-            bind_host = self.host if self.host is not None else ""
-            self.udp_protocol = _UDPProtocol()
-            self.udp_transport, _ = await loop.create_datagram_endpoint(
-                lambda: self.udp_protocol,
-                local_addr=(bind_host, self.port),
+            bind_host = self.local_udp_bind_address if self.local_udp_bind_address is not None else "0.0.0.0"
+            # Bind UDP using an ephemeral port (0) so the OS picks a free port.
+            # The actual bound port is read below from the transport's sockname.
+            self.udp_transport, self.udp_protocol = await loop.create_datagram_endpoint(
+                lambda: _UDPProtocol(self.log),
+                local_addr=(bind_host, 0),
+                remote_addr=(self.modbus_host, self.modbus_port),
+            )
+            # Determine the actual bound port (in case port was 0 / ephemeral)
+            try:
+                sockname = self.udp_transport.get_extra_info("sockname")
+                if sockname and len(sockname) >= 2:
+                    self.local_udp_bind_port = sockname[1]
+                else:
+                    # Some platforms may return just an IP for IPv6; handle gracefully
+                    self.local_udp_bind_port = getattr(self, "local_udp_bind_port", self.port)
+            except Exception:
+                self.local_udp_bind_port = getattr(self, "local_udp_bind_port", self.port)
+            self.log.debug(
+                "udp connect setup: bind_host=%r, tcp_host=%r, udp_bind_port=%r",
+                bind_host,
+                self.host,
+                getattr(self, "local_udp_bind_port", self.port),
             )
             self.log.info(
-                f"UDP bridge listening on {bind_host}:{self.port} "
+                f"UDP bridge listening on {bind_host}:{self.local_udp_bind_port} "
                 f"and ready to talk to {self.modbus_host}:{self.modbus_port}"
             )
+            
         else:
             self.log.info(
                 f"connecting Proxy to Modbus Device({self.modbus_host}:{self.modbus_port})..."
@@ -749,15 +801,18 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         async with self.lock:
             for i in range(attempts):
                 try:
+                    self.log.error("write_read A: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
                     await self.connect()
+                    self.log.error("write_read B: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
                     if self.modbus_type == "udp":
                         coro = self._udp_write_read(data)
                     else:
                         coro = self._write_read(data)
+                    self.log.error("write_read C: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
                     return await asyncio.wait_for(coro, self.timeout)
                 except Exception as error:
                     self.log.error(
-                        "write_read error [%s/%s]: %r", i + 1, attempts, error
+                        "%s write_read error [%s/%s]: %r", self.modbus_type, i + 1, attempts, error
                     )
                     await self.close()
 
@@ -771,14 +826,17 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         if self.udp_transport is None or self.udp_protocol is None:
             raise RuntimeError("UDP transport not initialized")
 
+        self.log.debug("_udp_write_read: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
         # Helper to render templates using simple formatting
-        def render_template(tpl):
-            if tpl is None:
-                return None
+        def render_template(tpl: str) -> str:
             # Use the bridge listen address for HOST/PORT (so device can connect back)
-            mapping = {"HOST": self.host or "0.0.0.0", "PORT": str(self.port or "")}
+            mapping = {
+                "HOST": self.udp_protocol.return_addr[0] if self.udp_protocol and self.udp_protocol.return_addr else "0.0.0.0",
+                "PORT": str(self.udp_protocol.return_addr[1] if self.udp_protocol and self.udp_protocol.return_addr else ""),
+            }
 
-            v = Template(tpl).safe_substitute(**mapping)
+            v = tpl.format(**mapping)
+            self.log.debug("UDP sendto template: %r substituted: %s", mapping, v)  # TODO remove
             return v
 
         # Preflight: send a server string and expect a specific response
@@ -791,6 +849,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             except ValueError:
                 set_addr_req_bytes = set_addr_req.encode()
 
+            self.log.debug("UDP sendto A: '%s':%d %s", self.modbus_host, self.modbus_port, set_addr_req_bytes)  # TODO remove
             self.udp_transport.sendto(
                 set_addr_req_bytes, (self.modbus_host, self.modbus_port)
             )
@@ -801,6 +860,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             except Exception as e:
                 self.log.error("UDP preflight timeout/wait error: %r", e)
                 return None
+            self.log.debug("UDP recv A: %s", data_recv)  # TODO remove
 
             # Compare response
             expected = render_template(self.udp_set_addr_resp_template)
@@ -821,6 +881,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         udp_request_data, tcp_data = self.udp_transformer.transform_tcp_udp(data)
 
         # Send payload to device
+        self.log.debug("UDP sendto B: '%s':%d %s -> %s", self.modbus_host, self.modbus_port, bytes.hex(data), bytes.hex(udp_request_data) )  # TODO remove
         self.udp_transport.sendto(
             bytes(udp_request_data), (self.modbus_host, self.modbus_port)
         )
@@ -834,6 +895,8 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         except Exception as e:
             self.log.error("UDP device response timeout/wait error: %r", e)
             return None
+
+        self.log.debug("UDP recv B: %s", udp_response_data)  # TODO remove
 
         return self.udp_transformer.transform_udp_tcp(
             udp_response_data, tcp_data
