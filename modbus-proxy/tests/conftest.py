@@ -40,7 +40,7 @@ def bridge_factory():
 
     def _make(
         udp_cfg=None,
-        url="udp://192.168.25.147:1502",
+        url="rtcpmrtu://192.168.25.147:1502",
         timeout=1,
         bind="192.168.25.247:8999",
     ):
@@ -49,8 +49,8 @@ def bridge_factory():
             mod_conf.update(udp_cfg)
         cfg = {"modbus": mod_conf, "listen": {"bind": bind}}
         bridge = ModBus(cfg)
-        bridge.udp_protocol = DummyProtocol()
-        bridge.udp_transport = DummyTransport()
+        bridge.rtcpmrtu_protocol = DummyProtocol()
+        bridge.rtcpmrtu_transport = DummyTransport()
         return bridge
 
     return _make

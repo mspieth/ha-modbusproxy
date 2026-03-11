@@ -22,6 +22,7 @@ import stat
 from urllib.parse import urlparse, ParseResult
 import ast
 import types
+import struct
 import sys
 import traceback
 
@@ -64,23 +65,40 @@ DEFAULT_LOG_CONFIG = {
 log = logging.getLogger("modbus-proxy")
 
 
-DEFAULT_UDP_CONFIG_TRANSFORM_SNIPPET = """
-import struct, sys
-tcp_pkt_fmt = ">HHH%ds"
-udp_pkt_fmt = ">HHHBB%ds2s"
-def transform_tcp_udp(tcp_in_data: bytes) -> bytes:
+# Built-in rtcpmrtu transformer (no external config snippet)
+def _builtin_transform_tcp_udp(tcp_in_data: bytes):
+    tcp_pkt_fmt = ">HHH%ds"
+    # UDP payload layout: TID, PROT, LEN, GWID, ROUTING_BYTE, PAYLOAD, CRC(little-endian)
     payload_len = len(tcp_in_data) - 6
     tcp_data = struct.unpack(tcp_pkt_fmt % payload_len, tcp_in_data)
-    if payload_len != tcp_data[2]:
-        raise Exception("Debug: Len mismatch ")
-    return struct.pack(udp_pkt_fmt % payload_len, tcp_data[0], 0x0102, payload_len + 4, 0xFF, 0x04, tcp_data[3], struct.pack("<H", crc(tcp_data[3]))), tcp_data
+    crc_val = modbus_crc(tcp_data[3])
+    udp_pkt = struct.pack(
+        (">HHHBB%ds2s" % payload_len),
+        tcp_data[0],
+        0x0102,
+        payload_len + 4,
+        0xFF,
+        0x04,
+        tcp_data[3],
+        crc_val.to_bytes(2, byteorder="little"),
+    )
+    return udp_pkt, tcp_data
 
-def transform_udp_tcp(udp_in_data: bytes, tcp_in_data: bytes) -> bytes:
+
+def _builtin_transform_udp_tcp(udp_in_data: bytes, tcp_meta):
+    # tcp_meta is the tuple returned by transform_tcp_udp (tcp_data)
+    # Unpack UDP and reconstruct a TCP MBAP response using tcp_meta[1] as proto
+    # UDP format: TID(2), PROT(2), LEN(2), GWID(1), ROUTE(1), PAYLOAD(N), CRC(2)
+    if len(udp_in_data) < 10:
+        raise ValueError("UDP packet too short")
+    # determine payload length
     payload_len = len(udp_in_data) - 10
-    struct_str = udp_pkt_fmt % payload_len
-    udp_data = struct.unpack(udp_pkt_fmt % payload_len, udp_in_data)
-    return struct.pack(tcp_pkt_fmt % payload_len, udp_data[0], tcp_in_data[1], payload_len, udp_data[5])
-"""
+    udp_fmt = ">HHHBB%ds2s" % payload_len
+    udp_data = struct.unpack(udp_fmt, udp_in_data)
+    # Build TCP MBAP: TID, proto from tcp_meta[1], length, payload
+    tcp_pkt_fmt = ">HHH%ds" % payload_len
+    tcp_pkt = struct.pack(tcp_pkt_fmt, udp_data[0], tcp_meta[1], payload_len, udp_data[5])
+    return tcp_pkt
 
 
 def parse_url(url: str) -> ParseResult:
@@ -214,17 +232,9 @@ class Connection:  # pylint: disable=too-many-instance-attributes
             finally:
                 self.reader = None
                 self.writer = None
-        # Close UDP transport if present
-        if getattr(self, "udp_transport", None) is not None:
-            try:
-                self.udp_transport.close()  # pylint: disable=access-member-before-definition
-            except Exception:
-                pass
-            finally:
-                # pylint: disable=attribute-defined-outside-init
-
-                self.udp_transport = None
-                self.udp_protocol = None
+        # No intermediate UDP attributes are stored on the object anymore.
+        # Reverse-TCP listener and UDP transport are created as local variables
+        # during `open()` and cleaned up there.
 
     async def _write(self, data):
         # pylint: disable=no-member
@@ -599,31 +609,59 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             super().__init__(f"ModBus({url.hostname}:{url.port})", None, None)
             self.modbus_host = url.hostname
             self.modbus_port = url.port
-        elif url.scheme == "udp":
-            self.modbus_type = "udp"
+        elif url.scheme == "rtcpmrtu":
+            # Reverse TCP Modded RTU: TCP-based but with configurable MBAP
+            # protocol override, routing bytes before unit id and CRC appended.
+            # Also supports the reverse-TCP preflight flow (previously UDP
+            # mode) via configurable templates.
+            self.modbus_type = "rtcpmrtu"
             super().__init__(f"ModBus({url.hostname}:{url.port})", None, None)
             self.modbus_host = url.hostname
             self.modbus_port = url.port
-            # UDP specific attributes
-            transform_snippet = modbus.get(
-                "transform_snippet", DEFAULT_UDP_CONFIG_TRANSFORM_SNIPPET
-            )
-            self.udp_transformer = module_from_string(
-                transform_snippet,
-                name="udp_transform_module",
-                extra_globals={"crc": modbus_crc},
-            )
-            self.udp_set_addr_template = modbus.get("set_client_address")
-            self.udp_set_addr_resp_template = modbus.get("set_client_address_response")
-            self.udp_pre_timeout = modbus.get("set_client_timeout", self.timeout or 5)
-            # Determine a local address on the same network as the modbus host so
-            # remote UDP devices can send replies back to this address. Also
-            # capture the local port we'll bind so templates can use it.
-            # self.local_udp_bind_port = self.port
-            if bind.hostname:
-                self.local_udp_bind_address = bind.hostname
+            # Configurable MBAP/protocol override (accept int or hex string)
+            protocol_remap = modbus.get("protocol_remapping", modbus.get("mbap_protocol", None))
+            if isinstance(protocol_remap, str):
+                try:
+                    self.protocol_remapping = int(protocol_remap, 0)
+                except Exception:
+                    # support plain hex without 0x
+                    try:
+                        self.protocol_remapping = int(protocol_remap, 16)
+                    except Exception:
+                        self.protocol_remapping = None
             else:
-                self.local_udp_bind_address = None
+                self.protocol_remapping = int(protocol_remap) if protocol_remap is not None else None
+            # Routing bytes (hex string expected). If not provided, default
+            # to empty bytes (no routing prefix inserted).
+            routing = modbus.get("routing_bytes", modbus.get("routing", None))
+            if routing:
+                try:
+                    self.routing_bytes = bytes.fromhex(routing)
+                except Exception:
+                    self.routing_bytes = b""
+            else:
+                self.routing_bytes = b""
+            # Built-in rtcpmrtu transformer (no external snippet)
+            class _BuiltinTransformer:
+                @staticmethod
+                def transform_tcp_udp(tcp_in_data: bytes):
+                    return _builtin_transform_tcp_udp(tcp_in_data)
+
+                @staticmethod
+                def transform_udp_tcp(udp_in_data: bytes, tcp_meta):
+                    return _builtin_transform_udp_tcp(udp_in_data, tcp_meta)
+
+            self.rtcpmrtu_transformer = _BuiltinTransformer()
+            # Read preflight templates from rtcpmrtu_session_start_* keys
+            # These tell the device how to connect back to this proxy (master).
+            self.rtcpmrtu_session_start_request = modbus.get("rtcpmrtu_session_start_request")
+            self.rtcpmrtu_session_start_response = modbus.get(
+                "rtcpmrtu_session_start_response"
+            )
+            self.rtcpmrtu_session_start_timeout = modbus.get(
+                "rtcpmrtu_session_start_timeout", self.timeout or 5
+            )
+        # Note: UDP mode removed — rtcpmrtu branch handles reverse-TCP preflight
         else:
             self.modbus_type = "tcp"
             super().__init__(f"ModBus({url.hostname}:{url.port})", None, None)
@@ -709,11 +747,16 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                 )
                 self.log.info(f"connected to RTU device {self.device} (sync mode)!")
         elif self.modbus_type == "udp":
+            # Reverse-TCP UDP mode:
+            # 1) Create a short-lived UDP endpoint so we know the local address
+            # 2) Start an ephemeral TCP listener on that local address
+            # 3) Send the `rtcpmrtu_session_start_request` preflight UDP message to the device
+            # 4) Wait for the UDP preflight response `rtcpmrtu_session_start_response`
+            # 5) Wait for the device to connect back to the ephemeral TCP listener
+            # 6) Promote the accepted TCP connection to the active Modbus TCP session
             # pylint: disable=attribute-defined-outside-init
-            # Create a UDP endpoint bound to the proxy listen address so device can reply to it
             loop = asyncio.get_running_loop()
 
-            self.log.info("udp connect A:")  #TODO remove
             class _UDPProtocol(asyncio.DatagramProtocol):
                 def __init__(self, parent_log):
                     self.queue = asyncio.Queue()
@@ -722,11 +765,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
 
                 def connection_made(self, transport):
                     self.transport = transport
-                    # Prefer the transport-provided sockname which is portable
                     local = transport.get_extra_info("sockname")
-                    # peer may be available when socket is connected
-                    peer = transport.get_extra_info("peername")
-                    # underlying socket as a fallback
                     sock = transport.get_extra_info("socket")
                     if local:
                         self.return_addr = local
@@ -738,7 +777,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                     else:
                         self.return_addr = None
                     try:
-                        self.log.info("udp connect return addr: %s", self.return_addr)
+                        self.log.info("udp local addr: %s", self.return_addr)
                     except Exception:
                         pass
 
@@ -748,34 +787,167 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                     except Exception:
                         pass
 
-            bind_host = self.local_udp_bind_address if self.local_udp_bind_address is not None else "0.0.0.0"
-            # Bind UDP using an ephemeral port (0) so the OS picks a free port.
-            # The actual bound port is read below from the transport's sockname.
-            self.udp_transport, self.udp_protocol = await loop.create_datagram_endpoint(
+            bind_host = self.host if self.host is not None else "0.0.0.0"
+
+            # Create UDP endpoint bound to an ephemeral port so we learn our local IP
+            udp_transport, udp_protocol = await loop.create_datagram_endpoint(
                 lambda: _UDPProtocol(self.log),
                 local_addr=(bind_host, 0),
                 remote_addr=(self.modbus_host, self.modbus_port),
             )
-            # Determine the actual bound port (in case port was 0 / ephemeral)
+
+            # Determine local UDP bind address/port (local variables only)
             try:
-                sockname = self.udp_transport.get_extra_info("sockname")
+                sockname = udp_transport.get_extra_info("sockname")
                 if sockname and len(sockname) >= 2:
-                    self.local_udp_bind_port = sockname[1]
+                    local_udp_bind_port = sockname[1]
                 else:
-                    # Some platforms may return just an IP for IPv6; handle gracefully
-                    self.local_udp_bind_port = getattr(self, "local_udp_bind_port", self.port)
+                    local_udp_bind_port = getattr(self, "local_udp_bind_port", self.port)
             except Exception:
-                self.local_udp_bind_port = getattr(self, "local_udp_bind_port", self.port)
-            self.log.debug(
-                "udp connect setup: bind_host=%r, tcp_host=%r, udp_bind_port=%r",
-                bind_host,
-                self.host,
-                getattr(self, "local_udp_bind_port", self.port),
+                local_udp_bind_port = getattr(self, "local_udp_bind_port", self.port)
+
+            # Use the UDP endpoint local IP as the address for the TCP listener (if available)
+            local_ip = (
+                udp_protocol.return_addr[0]
+                if getattr(udp_protocol, "return_addr", None)
+                else bind_host
             )
+
+            # Start ephemeral TCP listener that the device will connect to
+            async def _accept_handler(reader, writer):
+                # Accept the first connection and stash it for the open() waiter
+                if not hasattr(self, "_reverse_tcp_conn_future"):
+                    self._reverse_tcp_conn_future = asyncio.get_running_loop().create_future()
+                if not self._reverse_tcp_conn_future.done():
+                    self._reverse_tcp_conn_future.set_result((reader, writer))
+                else:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+
+            tcp_bind_host = None if local_ip in ("0", "0.0.0.0", "0.0.0.0") else local_ip
+            reverse_tcp_server = await asyncio.start_server(_accept_handler, tcp_bind_host, 0)
+            try:
+                listener_sockname = reverse_tcp_server.sockets[0].getsockname()
+                listener_port = listener_sockname[1]
+            except Exception:
+                listener_port = 0
+
             self.log.info(
-                f"UDP bridge listening on {bind_host}:{self.local_udp_bind_port} "
-                f"and ready to talk to {self.modbus_host}:{self.modbus_port}"
+                "rtcpmrtu reverse-preflight listening on %s and reverse TCP listener on %s:%s (waiting for device)",
+                bind_host,
+                tcp_bind_host or "0.0.0.0",
+                listener_port,
             )
+
+            # Helper to render templates using the TCP listener address
+            def render_template(tpl: str) -> str:
+                mapping = {
+                    "HOST": local_ip if local_ip is not None else "0.0.0.0",
+                    "PORT": str(listener_port),
+                }
+                v = tpl.format(**mapping)
+                self.log.debug("rtcpmrtu set template: %r -> %r", mapping, v)
+                return v
+
+            # If configured, send the preflight session-start request and expect the configured response
+            if self.rtcpmrtu_session_start_request and self.rtcpmrtu_session_start_response:
+                set_addr_req = render_template(self.rtcpmrtu_session_start_request)
+                try:
+                    set_addr_req_bytes = bytes.fromhex(set_addr_req)
+                except Exception:
+                    set_addr_req_bytes = set_addr_req.encode()
+
+                # keep payload exact (no padding)
+                udp_transport.sendto(
+                    set_addr_req_bytes, (self.modbus_host, self.modbus_port)
+                )
+                try:
+                    data_recv, _ = await asyncio.wait_for(
+                        udp_protocol.queue.get(), timeout=self.rtcpmrtu_session_start_timeout
+                    )
+                except Exception as e:
+                    self.log.error("UDP preflight timeout/wait error: %r", e)
+                    # Cleanup listener and UDP transport
+                    try:
+                        reverse_tcp_server.close()
+                        await reverse_tcp_server.wait_closed()
+                    except Exception:
+                        pass
+                    try:
+                        udp_transport.close()
+                    except Exception:
+                        pass
+                    return
+
+                expected = render_template(self.rtcpmrtu_session_start_response)
+                try:
+                    expected_bytes = bytes.fromhex(expected)
+                except Exception:
+                    expected_bytes = expected.encode()
+
+                if data_recv != expected_bytes:
+                    self.log.error(
+                        "UDP preflight response mismatch: got %r expected %r",
+                        data_recv,
+                        expected_bytes,
+                    )
+                    # Cleanup
+                    try:
+                        reverse_tcp_server.close()
+                        await reverse_tcp_server.wait_closed()
+                    except Exception:
+                        pass
+                    try:
+                        udp_transport.close()
+                    except Exception:
+                        pass
+                    return
+
+            # Wait for the device to connect back to our TCP listener
+            try:
+                self.log.info("waiting for device to connect back to TCP listener...")
+                reader, writer = await asyncio.wait_for(
+                    getattr(self, "_reverse_tcp_conn_future", asyncio.get_running_loop().create_future()),
+                    timeout=self.timeout or 30,
+                )
+            except Exception as e:
+                self.log.error("Timeout waiting for device TCP connection: %r", e)
+                try:
+                    reverse_tcp_server.close()
+                    await reverse_tcp_server.wait_closed()
+                except Exception:
+                    pass
+                try:
+                    udp_transport.close()
+                except Exception:
+                    pass
+                return
+
+            # Promote the accepted TCP connection to active session
+            peer = writer.get_extra_info("peername")
+            if peer and len(peer) >= 2:
+                self.modbus_host = peer[0]
+                self.modbus_port = peer[1]
+            self.reader = reader
+            self.writer = writer
+            self.log.info("Device connected from %s:%s", self.modbus_host, self.modbus_port)
+
+            # Close UDP transport and the temporary listener now that connection is established
+            try:
+                udp_transport.close()
+            except Exception:
+                pass
+            try:
+                reverse_tcp_server.close()
+                await reverse_tcp_server.wait_closed()
+            except Exception:
+                pass
+
+            # Use TCP behaviour from now on
+            self.modbus_type = "tcp"
             
         else:
             self.log.info(
@@ -804,10 +976,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                     self.log.error("write_read A: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
                     await self.connect()
                     self.log.error("write_read B: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
-                    if self.modbus_type == "udp":
-                        coro = self._udp_write_read(data)
-                    else:
-                        coro = self._write_read(data)
+                    coro = self._write_read(data)
                     self.log.error("write_read C: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
                     return await asyncio.wait_for(coro, self.timeout)
                 except Exception as error:
@@ -819,88 +988,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
     async def _write_read(self, data):
         await self._write(data)
         return await self._read()
-
-    async def _udp_write_read(self, data):
-        """Send data to Modbus device via UDP with optional preflight and MBAP mappings."""
-        # Ensure transport is available
-        if self.udp_transport is None or self.udp_protocol is None:
-            raise RuntimeError("UDP transport not initialized")
-
-        self.log.debug("_udp_write_read: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
-        # Helper to render templates using simple formatting
-        def render_template(tpl: str) -> str:
-            # Use the bridge listen address for HOST/PORT (so device can connect back)
-            mapping = {
-                "HOST": self.udp_protocol.return_addr[0] if self.udp_protocol and self.udp_protocol.return_addr else "0.0.0.0",
-                "PORT": str(self.udp_protocol.return_addr[1] if self.udp_protocol and self.udp_protocol.return_addr else ""),
-            }
-
-            v = tpl.format(**mapping)
-            self.log.debug("UDP sendto template: %r substituted: %s", mapping, v)  # TODO remove
-            return v
-
-        # Preflight: send a server string and expect a specific response
-        # support new config keys: set_client_address / set_client_address_response
-        if self.udp_set_addr_template and self.udp_set_addr_resp_template:
-            set_addr_req = render_template(self.udp_set_addr_template)
-
-            try:
-                set_addr_req_bytes = bytes.fromhex(set_addr_req)
-            except ValueError:
-                set_addr_req_bytes = set_addr_req.encode()
-
-            self.log.debug("UDP sendto A: '%s':%d %s", self.modbus_host, self.modbus_port, set_addr_req_bytes)  # TODO remove
-            self.udp_transport.sendto(
-                set_addr_req_bytes, (self.modbus_host, self.modbus_port)
-            )
-            try:
-                data_recv, _ = await asyncio.wait_for(
-                    self.udp_protocol.queue.get(), timeout=self.udp_pre_timeout
-                )
-            except Exception as e:
-                self.log.error("UDP preflight timeout/wait error: %r", e)
-                return None
-            self.log.debug("UDP recv A: %s", data_recv)  # TODO remove
-
-            # Compare response
-            expected = render_template(self.udp_set_addr_resp_template)
-            try:
-                expected_bytes = bytes.fromhex(expected)
-            except Exception:
-                expected_bytes = expected.encode()
-
-            if data_recv != expected_bytes:
-                self.log.error(
-                    "UDP preflight response mismatch: got %r expected %r",
-                    data_recv,
-                    expected_bytes,
-                )
-                return None
-
-        # pylint: disable=no-member
-        udp_request_data, tcp_data = self.udp_transformer.transform_tcp_udp(data)
-
-        # Send payload to device
-        self.log.debug("UDP sendto B: '%s':%d %s -> %s", self.modbus_host, self.modbus_port, bytes.hex(data), bytes.hex(udp_request_data) )  # TODO remove
-        self.udp_transport.sendto(
-            bytes(udp_request_data), (self.modbus_host, self.modbus_port)
-        )
-
-        # Wait for response
-        resp_timeout = self.timeout
-        try:
-            udp_response_data, _ = await asyncio.wait_for(
-                self.udp_protocol.queue.get(), timeout=resp_timeout
-            )
-        except Exception as e:
-            self.log.error("UDP device response timeout/wait error: %r", e)
-            return None
-
-        self.log.debug("UDP recv B: %s", udp_response_data)  # TODO remove
-
-        return self.udp_transformer.transform_udp_tcp(
-            udp_response_data, tcp_data
-        )  # pylint: disable=no-member
 
     def _transform_request(
         self, request, source_format=None
@@ -942,6 +1029,8 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                     return request
 
                 # Extract RTU data from TCP request (skip MBAP header)
+                transaction_id = request[0:2]
+                proto_id = request[2:4]
                 uid = request[6]  # Unit ID from TCP message
                 rtu_data = request[6:]  # Unit ID + Function + Data
 
@@ -954,15 +1043,15 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                         "remapping unit ID %s to %s in request", uid, new_uid
                     )
 
-                # Calculate and append CRC
+                # (rtcpmrtu handled in its own branch below)
+
+                # Default RTU conversion: Calculate and append CRC
                 crc_value = modbus_crc(rtu_data)
-                rtu_request = bytes(rtu_data) + crc_value.to_bytes(
-                    2, byteorder="little"
-                )
+                rtu_request = bytes(rtu_data) + crc_value.to_bytes(2, byteorder="little")
 
                 return rtu_request
 
-            # Input is already RTU over TCP, just handle unit ID remapping
+            # Input is already RTU over TCP
             self.log.debug(
                 f"TRANSFORM: {input_format} → {target_format} (RTU passthrough)"
             )
@@ -972,14 +1061,63 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             if uid != new_uid:
                 request = bytearray(request)
                 request[0] = new_uid
-                # Recalculate CRC
-                request = request[0:-2] + modbus_crc(request[0:-2]).to_bytes(
-                    2, byteorder="little"
-                )
                 self.log.debug("remapping unit ID %s to %s in request", uid, new_uid)
+
+            # (rtcpmrtu handled in its own branch below)
+
+            # Default RTU passthrough
+            # Recalculate CRC
+            request = request[0:-2] + modbus_crc(request[0:-2]).to_bytes(2, byteorder="little")
             return request
 
         # Target device expects TCP format
+
+        # Special handling for rtcpmrtu: build MBAP payload containing
+        # routing bytes + RTU + CRC, and allow optional MBAP protocol override.
+        if self.modbus_type == "rtcpmrtu":
+            # rtcpmrtu treats device as TCP-hosted but payload contains a
+            # routing bytes followed by an RTU frame and CRC. When HA sends TCP
+            # input, convert to MBAP payload with routing+crc. When HA sends
+            # RTU-over-TCP, wrap into MBAP similarly.
+            if is_tcp_input:
+                # Convert TCP input to rtcpmrtu MBAP payload
+                if len(request) < 7:
+                    self.log.error("Invalid TCP request length: %d bytes", len(request))
+                    return request
+
+                transaction_id = request[0:2]
+                proto_id = request[2:4]
+                uid = request[6]
+                rtu_data = request[6:]
+
+                # Apply unit ID remapping
+                new_uid = self.unit_id_remapping.setdefault(uid, uid)
+                if uid != new_uid:
+                    rtu_data = bytearray(rtu_data)
+                    rtu_data[0] = new_uid
+                    rtu_data = bytes(rtu_data)
+
+                crc_value = modbus_crc(rtu_data)
+                payload = getattr(self, "routing_bytes", b"") + bytes(rtu_data) + crc_value.to_bytes(2, byteorder="little")
+
+                if getattr(self, "protocol_remapping", None) is not None:
+                    proto_val = int(self.protocol_remapping)
+                else:
+                    proto_val = int.from_bytes(proto_id, "big")
+                proto_bytes = proto_val.to_bytes(2, byteorder="big")
+                length = len(payload).to_bytes(2, byteorder="big")
+                tcp_request = transaction_id + proto_bytes + length + payload
+                return tcp_request
+
+            # Input is RTU over TCP - wrap into MBAP with prefix+CRC
+            rtu_payload = bytes(request)
+            crc_value = modbus_crc(rtu_payload)
+            payload = getattr(self, "routing_bytes", b"") + rtu_payload + crc_value.to_bytes(2, byteorder="little")
+            transaction_id = b"\x00\x01"
+            proto_val = getattr(self, "protocol_remapping", None) or 0
+            proto_bytes = int(proto_val).to_bytes(2, byteorder="big")
+            length = len(payload).to_bytes(2, byteorder="big")
+            return transaction_id + proto_bytes + length + payload
 
         if is_tcp_input:
             # Input is TCP, keep TCP format, only handle unit ID remapping
@@ -1076,6 +1214,41 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
 
                 tcp_reply = transaction_id + protocol_id + length + rtu_data
 
+                return tcp_reply
+
+        # Handle replies from rtcpmrtu devices that send a modified TCP payload
+        if self.modbus_type == "rtcpmrtu":
+            # Expect MBAP header + payload where payload = routing bytes + RTU + CRC
+            if len(reply) >= 7:
+                transaction_id = reply[0:2]
+                # incoming proto may be override; HA expects 0
+                payload = reply[6:]
+                # strip routing bytes if present
+                routing = getattr(self, "routing_bytes", b"")
+                if routing and payload.startswith(routing):
+                    payload_no_pre = payload[len(routing) :]
+                else:
+                    payload_no_pre = payload
+                # strip CRC if present
+                if len(payload_no_pre) >= 3:
+                    rtu_no_crc = payload_no_pre[:-2]
+                else:
+                    rtu_no_crc = payload_no_pre
+
+                # Apply inverse unit ID remapping
+                if len(rtu_no_crc) > 0:
+                    uid = rtu_no_crc[0]
+                    inverse_unit_id_map = {v: k for k, v in self.unit_id_remapping.items()}
+                    new_uid = inverse_unit_id_map.setdefault(uid, uid)
+                    if uid != new_uid:
+                        rtu_no_crc = bytearray(rtu_no_crc)
+                        rtu_no_crc[0] = new_uid
+                        rtu_no_crc = bytes(rtu_no_crc)
+
+                # Build TCP reply expected by HA (protocol id 0)
+                protocol_id = b"\x00\x00"
+                length = len(rtu_no_crc).to_bytes(2, byteorder="big")
+                tcp_reply = transaction_id + protocol_id + length + rtu_no_crc
                 return tcp_reply
 
             # Keep RTU format for HA (RTU over TCP)
@@ -1211,7 +1384,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         async with self.server:
             device_info = (
                 f"Device({self.modbus_host}:{self.modbus_port})"
-                if self.modbus_type in ["tcp", "rtutcp", "udp"]
+                if self.modbus_type in ["tcp", "rtutcp", "udp", "rtcpmrtu"]
                 else f"Device({self.device})"
             )
             self.log.info(

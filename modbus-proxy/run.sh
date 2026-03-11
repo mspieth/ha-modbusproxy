@@ -215,30 +215,34 @@ EOF
       stopbits: $STOPBITS
       parity: $PARITY
 EOF
-    elif [ "$DEVICE_TYPE" = "udp" ]; then
+    elif [ "$DEVICE_TYPE" = "rtcpmrtu" ]; then
         PORT=$(bashio::config "modbus_devices[${DEVICE_COUNT}].port" "8899")
-        SET_CLIENT_ADDRESS=$(bashio::config "modbus_devices[${DEVICE_COUNT}].set_client_address" "")
-        SET_CLIENT_ADDRESS_RESPONSE=$(bashio::config "modbus_devices[${DEVICE_COUNT}].set_client_address_response" "")
-        TRANSFORM_SNIPPET=$(bashio::config "modbus_devices[${DEVICE_COUNT}].transform_snippet" "")
+        RTCP_SESSION_START_REQUEST=$(bashio::config "modbus_devices[${DEVICE_COUNT}].rtcpmrtu_session_start_request" "")
+        RTCP_SESSION_START_RESPONSE=$(bashio::config "modbus_devices[${DEVICE_COUNT}].rtcpmrtu_session_start_response" "")
+        PROTOCOL_REMAPPING=$(bashio::config "modbus_devices[${DEVICE_COUNT}].protocol_remapping" "")
+        ROUTING_BYTES=$(bashio::config "modbus_devices[${DEVICE_COUNT}].routing_bytes" "")
+        RTCP_SESSION_START_TIMEOUT=$(bashio::config "modbus_devices[${DEVICE_COUNT}].rtcpmrtu_session_start_timeout" "")
 
-        echo "✅ $NAME: UDP $HOST:$PORT -> :$BIND_PORT"
+        echo "✅ $NAME: RTCP-MRTU $HOST:$PORT -> :$BIND_PORT"
 
-        # Add UDP device to YAML configuration (write the block scalar header first)
+        # Add rtcpmrtu device to YAML configuration
         cat >> "$CONFIG_PATH" <<EOF
   - modbus:
-      url: udp://$HOST:$PORT
+      url: rtcpmrtu://$HOST:$PORT
       bind_port: $BIND_PORT
-      set_client_address: $SET_CLIENT_ADDRESS
-      set_client_address_response: $SET_CLIENT_ADDRESS_RESPONSE
-      transform_snippet: |
+      rtcpmrtu_session_start_request: $RTCP_SESSION_START_REQUEST
+      rtcpmrtu_session_start_response: $RTCP_SESSION_START_RESPONSE
 EOF
 
-        # Append the transform snippet, preserving indentation for multiline Python code
-        if [ -n "$TRANSFORM_SNIPPET" ] && [ "$TRANSFORM_SNIPPET" != "null" ]; then
-            echo "$TRANSFORM_SNIPPET" | sed 's/^/        /' >> "$CONFIG_PATH"
-        else
-            # ensure there's at least an indented empty line for a valid YAML block
-            echo "        " >> "$CONFIG_PATH"
+        # Append rtcpmrtu-specific optional keys if provided
+        if [ -n "$PROTOCOL_REMAPPING" ] && [ "$PROTOCOL_REMAPPING" != "null" ]; then
+            echo "      protocol_remapping: $PROTOCOL_REMAPPING" >> "$CONFIG_PATH"
+        fi
+        if [ -n "$ROUTING_BYTES" ] && [ "$ROUTING_BYTES" != "null" ]; then
+            echo "      routing_bytes: $ROUTING_BYTES" >> "$CONFIG_PATH"
+        fi
+        if [ -n "$RTCP_SESSION_START_TIMEOUT" ] && [ "$RTCP_SESSION_START_TIMEOUT" != "null" ]; then
+            echo "      rtcpmrtu_session_start_timeout: $RTCP_SESSION_START_TIMEOUT" >> "$CONFIG_PATH"
         fi
 
     else

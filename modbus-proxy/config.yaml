@@ -101,14 +101,16 @@ schema:
   auto_detect_device: "bool?"
   modbus_devices:
     - name: "str"
-      protocol: "list(tcp|rtu|rtutcp|udp)"
+      protocol: "list(tcp|rtu|rtutcp|rtcpmrtu)"
       # TCP Modbus parameters
       host: "str?"
       port: "port?"
-      # UDP Modbus parameters
-      transform_snippet: "str?"
-      set_client_address: "str?"      # Set server IP address and port that the device will respond to
-      set_client_address_response: "str?"  # Response expected for successful server query command
+      # rtcpmrtu (reverse-TCP + RTU transport) parameters
+      rtcpmrtu_session_start_request: "str?"   # template to tell device the master TCP bind (HOST:PORT)
+      rtcpmrtu_session_start_response: "str?"  # expected response to session-start request
+      rtcpmrtu_session_start_timeout: "int?"   # preflight timeout in seconds (default: 5)
+      routing_bytes: "str?"                 # hex string e.g. "FF04" inserted before RTU payload
+      protocol_remapping: "str?"            # optional MBAP/protocol override (int or hex)
       # RTU/Serial Modbus parameters
       device: "str?"
       baudrate: "int?"
