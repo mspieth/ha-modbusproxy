@@ -96,6 +96,16 @@ options:
       timeout: 3.0
       connection_time: 0.1
       unit_id_remapping: "1<>10"
+    - name: "RTCP-MRTU Gateway (Reverse TCP)"
+      protocol: "rtcpmrtu"
+      host: "192.168.1.200"
+      port: 8899
+      rtcp_listen_port: 8899
+      rtcpmrtu_session_start_request: "{HOST}:{PORT}"
+      rtcpmrtu_session_start_response: "OK"
+      bind_port: 506
+      timeout: 10.0
+      connection_time: 1.0
 schema:
   log_level: "list(info|warning|error|debug)?"
   auto_detect_device: "bool?"
@@ -111,6 +121,7 @@ schema:
       rtcpmrtu_session_start_timeout: "int?"   # preflight timeout in seconds (default: 5)
       routing_bytes: "str?"                 # hex string e.g. "FF04" inserted before RTU payload
       protocol_remapping: "str?"            # optional MBAP/protocol override (int or hex)
+      rtcp_listen_port: "port?"            # optional explicit reverse-TCP listen port (0 = ephemeral)
       # RTU/Serial Modbus parameters
       device: "str?"
       baudrate: "int?"

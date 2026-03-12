@@ -292,6 +292,14 @@ modbus_devices:
     bind_port: 504
     timeout: 5.0
     connection_time: 1.0
+  - name: "RTCP-MRTU Gateway (Reverse TCP)"
+    host: "192.168.1.200"
+    port: 8899
+    protocol: "rtcpmrtu"
+    rtcp_listen_port: 8899  # optional: explicit reverse-TCP listen port (0 = ephemeral)
+    bind_port: 506
+    timeout: 10.0
+    connection_time: 1.0
   - name: "RTU Temperature Sensor"
     device: "/dev/ttyACM0"
     baudrate: 115200

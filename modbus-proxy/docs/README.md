@@ -126,6 +126,15 @@ devices:
 
         listen:
             bind: ":8899"
+            # For rtcpmrtu devices you can optionally set an explicit
+            # reverse-TCP listen port (0 = ephemeral) using
+            # `rtcp_listen_port` under the `modbus` block. If omitted
+            # the proxy will use an ephemeral port and inject the
+            # chosen port into any session-start templates.
+            # Example:
+            # modbus:
+            #   url: rtcpmrtu://192.168.1.200:8899
+            #   rtcp_listen_port: 8899
 ```
 
 ## Viewing Diagrams

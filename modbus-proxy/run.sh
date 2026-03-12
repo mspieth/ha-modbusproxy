@@ -217,6 +217,7 @@ EOF
 EOF
     elif [ "$DEVICE_TYPE" = "rtcpmrtu" ]; then
         PORT=$(bashio::config "modbus_devices[${DEVICE_COUNT}].port" "8899")
+        RTCP_LISTEN_PORT=$(bashio::config "modbus_devices[${DEVICE_COUNT}].rtcp_listen_port" "")
         RTCP_SESSION_START_REQUEST=$(bashio::config "modbus_devices[${DEVICE_COUNT}].rtcpmrtu_session_start_request" "")
         RTCP_SESSION_START_RESPONSE=$(bashio::config "modbus_devices[${DEVICE_COUNT}].rtcpmrtu_session_start_response" "")
         PROTOCOL_REMAPPING=$(bashio::config "modbus_devices[${DEVICE_COUNT}].protocol_remapping" "")
@@ -233,6 +234,11 @@ EOF
       rtcpmrtu_session_start_request: $RTCP_SESSION_START_REQUEST
       rtcpmrtu_session_start_response: $RTCP_SESSION_START_RESPONSE
 EOF
+
+        # Optional: include explicit reverse-TCP listen port if configured
+        if [ -n "$RTCP_LISTEN_PORT" ] && [ "$RTCP_LISTEN_PORT" != "null" ]; then
+            echo "      rtcp_listen_port: $RTCP_LISTEN_PORT" >> "$CONFIG_PATH"
+        fi
 
         # Append rtcpmrtu-specific optional keys if provided
         if [ -n "$PROTOCOL_REMAPPING" ] && [ "$PROTOCOL_REMAPPING" != "null" ]; then

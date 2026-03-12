@@ -31,7 +31,7 @@ __version__ = "2.3.1"  # TODO remove
 
 # Changelog:
 # 2.3.1 - Minor bug fixes and improvements TODO remove
-# 2.3.0 - Added UDP mode
+# 2.3.0 - Added Reverse TCP mode with UDP connection start
 # 0.8.5 - Normalize RTU device path: ensure absolute path and resolve symlinks
 # 0.8.4 - Fix RTU over TCP communication issue, improve format detection
 #         - Fixed assumption that HA always expects TCP format responses
@@ -63,42 +63,6 @@ DEFAULT_LOG_CONFIG = {
 }
 
 log = logging.getLogger("modbus-proxy")
-
-
-# Built-in rtcpmrtu transformer (no external config snippet)
-def _builtin_transform_tcp_udp(tcp_in_data: bytes):
-    tcp_pkt_fmt = ">HHH%ds"
-    # UDP payload layout: TID, PROT, LEN, GWID, ROUTING_BYTE, PAYLOAD, CRC(little-endian)
-    payload_len = len(tcp_in_data) - 6
-    tcp_data = struct.unpack(tcp_pkt_fmt % payload_len, tcp_in_data)
-    crc_val = modbus_crc(tcp_data[3])
-    udp_pkt = struct.pack(
-        (">HHHBB%ds2s" % payload_len),
-        tcp_data[0],
-        0x0102,
-        payload_len + 4,
-        0xFF,
-        0x04,
-        tcp_data[3],
-        crc_val.to_bytes(2, byteorder="little"),
-    )
-    return udp_pkt, tcp_data
-
-
-def _builtin_transform_udp_tcp(udp_in_data: bytes, tcp_meta):
-    # tcp_meta is the tuple returned by transform_tcp_udp (tcp_data)
-    # Unpack UDP and reconstruct a TCP MBAP response using tcp_meta[1] as proto
-    # UDP format: TID(2), PROT(2), LEN(2), GWID(1), ROUTE(1), PAYLOAD(N), CRC(2)
-    if len(udp_in_data) < 10:
-        raise ValueError("UDP packet too short")
-    # determine payload length
-    payload_len = len(udp_in_data) - 10
-    udp_fmt = ">HHHBB%ds2s" % payload_len
-    udp_data = struct.unpack(udp_fmt, udp_in_data)
-    # Build TCP MBAP: TID, proto from tcp_meta[1], length, payload
-    tcp_pkt_fmt = ">HHH%ds" % payload_len
-    tcp_pkt = struct.pack(tcp_pkt_fmt, udp_data[0], tcp_meta[1], payload_len, udp_data[5])
-    return tcp_pkt
 
 
 def parse_url(url: str) -> ParseResult:
@@ -641,18 +605,8 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                     self.routing_bytes = b""
             else:
                 self.routing_bytes = b""
-            # Built-in rtcpmrtu transformer (no external snippet)
-            class _BuiltinTransformer:
-                @staticmethod
-                def transform_tcp_udp(tcp_in_data: bytes):
-                    return _builtin_transform_tcp_udp(tcp_in_data)
 
-                @staticmethod
-                def transform_udp_tcp(udp_in_data: bytes, tcp_meta):
-                    return _builtin_transform_udp_tcp(udp_in_data, tcp_meta)
-
-            self.rtcpmrtu_transformer = _BuiltinTransformer()
-            # Read preflight templates from rtcpmrtu_session_start_* keys
+            # Read connect templates from rtcpmrtu_session_start_* keys
             # These tell the device how to connect back to this proxy (master).
             self.rtcpmrtu_session_start_request = modbus.get("rtcpmrtu_session_start_request")
             self.rtcpmrtu_session_start_response = modbus.get(
@@ -661,7 +615,12 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             self.rtcpmrtu_session_start_timeout = modbus.get(
                 "rtcpmrtu_session_start_timeout", self.timeout or 5
             )
-        # Note: UDP mode removed — rtcpmrtu branch handles reverse-TCP preflight
+            # Optional explicit port to listen for reverse-TCP connections.
+            # If 0 or not provided, an ephemeral port is used.
+            try:
+                self.rtcp_listen_port = int(modbus.get("rtcp_listen_port", 0) or 0)
+            except Exception:
+                self.rtcp_listen_port = 0
         else:
             self.modbus_type = "tcp"
             super().__init__(f"ModBus({url.hostname}:{url.port})", None, None)
@@ -746,12 +705,12 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                     timeout=self.timeout,
                 )
                 self.log.info(f"connected to RTU device {self.device} (sync mode)!")
-        elif self.modbus_type == "udp":
+        elif self.modbus_type == "rtcpmrtu":
             # Reverse-TCP UDP mode:
             # 1) Create a short-lived UDP endpoint so we know the local address
             # 2) Start an ephemeral TCP listener on that local address
-            # 3) Send the `rtcpmrtu_session_start_request` preflight UDP message to the device
-            # 4) Wait for the UDP preflight response `rtcpmrtu_session_start_response`
+            # 3) Send the `rtcpmrtu_session_start_request` session connect UDP message to the device
+            # 4) Wait for the UDP session connect response `rtcpmrtu_session_start_response`
             # 5) Wait for the device to connect back to the ephemeral TCP listener
             # 6) Promote the accepted TCP connection to the active Modbus TCP session
             # pylint: disable=attribute-defined-outside-init
@@ -796,16 +755,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                 remote_addr=(self.modbus_host, self.modbus_port),
             )
 
-            # Determine local UDP bind address/port (local variables only)
-            try:
-                sockname = udp_transport.get_extra_info("sockname")
-                if sockname and len(sockname) >= 2:
-                    local_udp_bind_port = sockname[1]
-                else:
-                    local_udp_bind_port = getattr(self, "local_udp_bind_port", self.port)
-            except Exception:
-                local_udp_bind_port = getattr(self, "local_udp_bind_port", self.port)
-
             # Use the UDP endpoint local IP as the address for the TCP listener (if available)
             local_ip = (
                 udp_protocol.return_addr[0]
@@ -813,14 +762,23 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                 else bind_host
             )
 
+            # Prepare a Future that the accept handler will fulfill when the
+            # device connects back. Create it here to avoid races between the
+            # waiter and the handler (both must reference the same Future).
+            self._reverse_tcp_conn_future = asyncio.get_running_loop().create_future()
+
             # Start ephemeral TCP listener that the device will connect to
             async def _accept_handler(reader, writer):
-                # Accept the first connection and stash it for the open() waiter
-                if not hasattr(self, "_reverse_tcp_conn_future"):
-                    self._reverse_tcp_conn_future = asyncio.get_running_loop().create_future()
+                # Future `self._reverse_tcp_conn_future` is created before
+                # starting the listener; assume it exists. If it's already
+                # done, this is an extra connection — log and close it.
                 if not self._reverse_tcp_conn_future.done():
                     self._reverse_tcp_conn_future.set_result((reader, writer))
                 else:
+                    try:
+                        self.log.error("reverse TCP listener received extra connection, closing it")
+                    except Exception:
+                        pass
                     try:
                         writer.close()
                         await writer.wait_closed()
@@ -828,7 +786,9 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                         pass
 
             tcp_bind_host = None if local_ip in ("0", "0.0.0.0", "0.0.0.0") else local_ip
-            reverse_tcp_server = await asyncio.start_server(_accept_handler, tcp_bind_host, 0)
+            # Use configured listen port if provided, otherwise use ephemeral port 0
+            port_arg = self.rtcp_listen_port if getattr(self, "rtcp_listen_port", 0) else 0
+            reverse_tcp_server = await asyncio.start_server(_accept_handler, tcp_bind_host, port_arg)
             try:
                 listener_sockname = reverse_tcp_server.sockets[0].getsockname()
                 listener_port = listener_sockname[1]
@@ -836,7 +796,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                 listener_port = 0
 
             self.log.info(
-                "rtcpmrtu reverse-preflight listening on %s and reverse TCP listener on %s:%s (waiting for device)",
+                "rtcpmrtu modbustcp listening on %s and reverse TCP listener on %s:%s (waiting for device)",
                 bind_host,
                 tcp_bind_host or "0.0.0.0",
                 listener_port,
@@ -869,7 +829,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                         udp_protocol.queue.get(), timeout=self.rtcpmrtu_session_start_timeout
                     )
                 except Exception as e:
-                    self.log.error("UDP preflight timeout/wait error: %r", e)
+                    self.log.error("UDP session connect timeout/wait error: %r", e)
                     # Cleanup listener and UDP transport
                     try:
                         reverse_tcp_server.close()
@@ -910,7 +870,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             try:
                 self.log.info("waiting for device to connect back to TCP listener...")
                 reader, writer = await asyncio.wait_for(
-                    getattr(self, "_reverse_tcp_conn_future", asyncio.get_running_loop().create_future()),
+                    self._reverse_tcp_conn_future,
                     timeout=self.timeout or 30,
                 )
             except Exception as e:
@@ -946,9 +906,13 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             except Exception:
                 pass
 
-            # Use TCP behaviour from now on
-            self.modbus_type = "tcp"
-            
+            # Cleanup the temporary future used for the reverse-TCP accept
+            try:
+                if hasattr(self, "_reverse_tcp_conn_future"):
+                    delattr(self, "_reverse_tcp_conn_future")
+            except Exception:
+                pass
+
         else:
             self.log.info(
                 f"connecting Proxy to Modbus Device({self.modbus_host}:{self.modbus_port})..."
@@ -973,11 +937,8 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         async with self.lock:
             for i in range(attempts):
                 try:
-                    self.log.error("write_read A: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
                     await self.connect()
-                    self.log.error("write_read B: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
                     coro = self._write_read(data)
-                    self.log.error("write_read C: '%s':%d %s", self.modbus_host, self.modbus_port, bytes.hex(data))  # TODO remove
                     return await asyncio.wait_for(coro, self.timeout)
                 except Exception as error:
                     self.log.error(
@@ -1384,7 +1345,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         async with self.server:
             device_info = (
                 f"Device({self.modbus_host}:{self.modbus_port})"
-                if self.modbus_type in ["tcp", "rtutcp", "udp", "rtcpmrtu"]
+                if self.modbus_type in ["tcp", "rtutcp", "rtcpmrtu"]
                 else f"Device({self.device})"
             )
             self.log.info(
