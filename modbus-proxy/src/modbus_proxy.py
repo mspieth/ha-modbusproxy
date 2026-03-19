@@ -28,10 +28,9 @@ import sys
 import traceback
 
 
-__version__ = "2.3.1"  # TODO remove
+__version__ = "2.3.0"
 
 # Changelog:
-# 2.3.1 - Minor bug fixes and improvements TODO remove
 # 2.3.0 - Added Reverse TCP mode with UDP connection start
 # 0.8.5 - Normalize RTU device path: ensure absolute path and resolve symlinks
 # 0.8.4 - Fix RTU over TCP communication issue, improve format detection
@@ -645,111 +644,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             self.host = bind.hostname
         self.server = None
         self._reverse_tcp_conn_future = None
-        # Map listening socket fileno -> human-readable owner (for diagnostics)
-        self._listen_socket_map = {}
         self.lock = asyncio.Lock()
-
-        # BACKING DIAGNOSTIC (temporary): Background task for periodic FD logging.
-        # TODO: This instrumentation was added to diagnose FD leaks; remove
-        # it once the root cause has been identified and fixed.
-        # See: fd-snapshot-on-error diagnostic and related helpers below.
-        # (Marked temporary for clarity in code reviews.)
-        # Background task for periodic FD logging
-        self._fd_log_task = None
-
-    # TEMPORARY DIAGNOSTIC: return current process open file descriptor count.
-    # This helper exists to provide runtime visibility into FD usage while
-    # investigating a suspected descriptor leak. It should be removed or
-    # gated behind a configurable debug flag before being kept long-term.
-    def _get_fd_count(self):
-        """Return current process open file descriptor count or None if unavailable."""
-        try:
-            return len(os.listdir("/proc/self/fd"))
-        except Exception:
-            try:
-                import psutil  # pylint: disable=import-outside-toplevel
-
-                return psutil.Process().num_fds()
-            except Exception:
-                return None
-
-    # TEMPORARY DIAGNOSTIC: periodic FD monitor task.
-    # Logs FD counts at a regular interval to help detect trends. Remove
-    # this task once leakage is resolved.
-    async def _fd_monitor(self, interval: int = 10):
-        """Background task: log FD count every `interval` seconds until cancelled."""
-        try:
-            while True:
-                fd_count = self._get_fd_count()
-                try:
-                    if fd_count is not None:
-                        self.log.info("periodic process fd count: %s", fd_count)
-                    else:
-                        self.log.info("periodic process fd count: unavailable")
-                except Exception:
-                    pass
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            return
-
-    # TEMPORARY DIAGNOSTIC: fd snapshot helper.
-    # Produces a best-effort listing of open file descriptors and mapped
-    # owners (from `self._listen_socket_map`). Intended for debugging
-    # and should be removed once no longer needed.
-    def _fd_snapshot(self):
-        """Return a best-effort snapshot list of open fds.
-
-        Returns a list of (fileno:int, target:str, mapped_owner:str|None).
-        """
-        result = []
-        try:
-            entries = os.listdir("/proc/self/fd")
-            for name in sorted(entries, key=lambda x: int(x)):
-                try:
-                    fil = int(name)
-                except Exception:
-                    continue
-                target = None
-                try:
-                    target = os.readlink(f"/proc/self/fd/{name}")
-                except Exception:
-                    try:
-                        target = str(open(f"/proc/self/fd/{name}").read())
-                    except Exception:
-                        target = None
-                owner = self._listen_socket_map.get(fil)
-                result.append((fil, target, owner))
-            return result
-        except Exception:
-            # Fallback to psutil if available
-            try:
-                import psutil  # pylint: disable=import-outside-toplevel
-
-                proc = psutil.Process()
-                flist = []
-                try:
-                    for f in proc.open_files():
-                        flist.append((f.fd, f.path))
-                except Exception:
-                    pass
-                # psutil doesn't list socket fds via open_files; include num_fds
-                try:
-                    n = proc.num_fds()
-                except Exception:
-                    n = None
-                # Build best-effort mapping
-                for fd, path in flist:
-                    result.append((fd, path, self._listen_socket_map.get(fd)))
-                if n is None:
-                    return result
-                # If psutil gave a count but not all fds, append placeholders
-                if len(result) < n:
-                    # Add placeholder entries for unknown fds
-                    for i in range(n - len(result)):
-                        result.append((None, "<unknown>", None))
-                return result
-            except Exception:
-                return None
 
     @property
     def address(self):
@@ -832,8 +727,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             # pylint: disable=attribute-defined-outside-init
             loop = asyncio.get_running_loop()
 
-            self.log.info("%s open...", self.modbus_type)
-
             class _UDPProtocol(asyncio.DatagramProtocol):
                 def __init__(self, parent_log):
                     self.queue = asyncio.Queue()
@@ -879,19 +772,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                 remote_addr=(self.modbus_host_udp, self.modbus_port_udp),
             )
 
-            # Register UDP transport socket fileno for diagnostics (fileno -> 'udp')
-            try:
-                sock = udp_transport.get_extra_info("socket")
-                if sock is not None:
-                    try:
-                        fil = sock.fileno()
-                        addr = sock.getsockname()
-                        self._listen_socket_map[fil] = "udp_transport"
-                        self.log.info("listening udp_transport socket fileno=%s addr=%s", fil, addr)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # UDP endpoint created; local address available via protocol
 
             # Use the UDP endpoint local IP as the address for the TCP listener (if available)
             local_ip = (
@@ -943,19 +824,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
             except Exception:
                 listener_port = 0
 
-            # Register reverse-TCP listening sockets for diagnostics (fileno -> 'reverse_tcp')
-            try:
-                for sock in getattr(reverse_tcp_server, "sockets", []) or []:
-                    try:
-                        fil = sock.fileno()
-                        addr = sock.getsockname()
-                        self._listen_socket_map[fil] = "reverse_tcp"
-                        self.log.info("listening reverse_tcp socket fileno=%s addr=%s", fil, addr)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
             self.log.info(
                 "rtcpmrtu modbustcp listening on %s and reverse TCP listener on %s:%s (waiting for device)",
                 bind_host,
@@ -972,25 +840,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                 nonlocal self
                 try:
                     if reverse_tcp_server is not None:
-                        # remove mapping entries for reverse_tcp sockets
-                        for s in getattr(reverse_tcp_server, "sockets", []) or []:
-                            try:
-                                self._listen_socket_map.pop(s.fileno(), None)
-                            except Exception as e:
-                                self.log.warning("Failed popping reverse_tcp_server socket: %r", e)
-                                pass
-                        # Try to explicitly close underlying listening sockets
-                        # try:
-                        #     for s in getattr(reverse_tcp_server, "sockets", []) or []:
-                        #         try:
-                        #             try:
-                        #                 s.close()
-                        #             except Exception:
-                        #                 pass
-                        #         except Exception:
-                        #             pass
-                        # except Exception:
-                        #     pass
                         reverse_tcp_server.close()
                         try:
                             await reverse_tcp_server.wait_closed()
@@ -1006,21 +855,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                 # Close UDP transport if present
                 try:
                     if udp_transport is not None:
-                        # remove mapping for UDP transport socket if present
-                        try:
-                            sock = udp_transport.get_extra_info("socket")
-                            if sock is not None:
-                                try:
-                                    self._listen_socket_map.pop(sock.fileno(), None)
-                                except Exception:
-                                    pass
-                                # Attempt to explicitly close the socket
-                                # try:
-                                #     sock.close()
-                                # except Exception:
-                                #     pass
-                        except Exception:
-                            pass
                         udp_transport.close()
                         sock = udp_transport.get_extra_info('socket')  # get underlying socket (may be None)
                         if sock is not None:
@@ -1147,10 +981,7 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
 
     async def close(self):
         """Close the connection if required"""
-        self.log.info("%s close...", self.modbus_type)
-        # Call base class close implementation
         await super().close()
-        self.log.info("%s closed", self.modbus_type)
 
     async def connect(self):
         """Connection if required"""
@@ -1514,16 +1345,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
 
     async def handle_client(self, reader, writer):
         """Handle incoming client connection"""
-        # TEMPORARY DIAGNOSTIC: log FD count at accept time. Remove after
-        # investigation completes (left intentionally simple for visibility).
-        try:
-            fd_count = self._get_fd_count()
-            if fd_count is not None:
-                self.log.info("accept: process fd count: %s", fd_count)
-            else:
-                self.log.info("accept: process fd count: unavailable")
-        except Exception:
-            pass
         # Construct Client inside try/except so we can close the accepted
         # writer if Client construction fails to avoid leaking file descriptors.
         try:
@@ -1604,125 +1425,12 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         self.server = await asyncio.start_server(
             self.handle_client, self.host, self.port, start_serving=True
         )
-        # Register main server listening sockets for diagnostics (fileno -> 'main_server')
-        try:
-            for sock in getattr(self.server, "sockets", []) or []:
-                try:
-                    fil = sock.fileno()
-                    addr = sock.getsockname()
-                    self._listen_socket_map[fil] = "main_server"
-                    self.log.info("listening main_server socket fileno=%s addr=%s", fil, addr)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # Install an asyncio exception handler wrapper to emit our socket mapping
-        try:
-            loop = asyncio.get_running_loop()
-            if not hasattr(self, "_original_asyncio_exc_handler"):
-                self._original_asyncio_exc_handler = loop.get_exception_handler()
-
-            def _diag_exc_handler(loop_obj, context):
-                # Log original context
-                try:
-                    self.log.error("asyncio exception: %s", context.get("message") or context)
-                except Exception:
-                    pass
-                # If a socket is present in context, try to map its fileno
-                try:
-                    sock = context.get("socket") or context.get("transport")
-                    fileno = None
-                    if hasattr(sock, "fileno"):
-                        try:
-                            fileno = sock.fileno()
-                        except Exception:
-                            fileno = None
-                    # If mapping exists, log owner
-                    if fileno is not None:
-                        owner = self._listen_socket_map.get(fileno)
-                        try:
-                            self.log.error("asyncio accept on fileno=%s mapped_owner=%s", fileno, owner)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                # If this looks like an FD exhaustion (errno 24) attempt to
-                # capture a snapshot of /proc/self/fd (best-effort) so we can
-                # diagnose leaked descriptors.
-                try:
-                    exc = context.get("exception")
-                    message = context.get("message") or ""
-                    is_fd_exhaustion = False
-                    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 24:
-                        is_fd_exhaustion = True
-                    if isinstance(message, str) and (
-                        "out of system resource" in message.lower()
-                        or "no file descriptors available" in message.lower()
-                    ):
-                        is_fd_exhaustion = True
-                    if is_fd_exhaustion:
-                        try:
-                            # Call helper to log a detailed fd snapshot
-                            try:
-                                snap = self._fd_snapshot()
-                            except Exception:
-                                snap = None
-                            if snap is None:
-                                self.log.error("fd snapshot: unavailable")
-                            else:
-                                self.log.error("fd snapshot: %s entries", len(snap))
-                                for fil, target, owner in snap:
-                                    try:
-                                        self.log.error(" fd %s -> %s mapped_owner=%s", fil, target, owner)
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                # Call original handler if present
-                try:
-                    if self._original_asyncio_exc_handler:
-                        return self._original_asyncio_exc_handler(loop_obj, context)
-                except Exception:
-                    pass
-
-            loop.set_exception_handler(_diag_exc_handler)
-        except Exception:
-            pass
-
-        fd_count = self._get_fd_count()
-        try:
-            if fd_count is not None:
-                self.log.info("process fd count: %s", fd_count)
-            else:
-                self.log.info("process fd count: unavailable (no /proc or psutil)")
-        except Exception:
-            pass
-
-        # Start background FD monitor task
-        try:
-            if self._fd_log_task is None:
-                self._fd_log_task = asyncio.create_task(self._fd_monitor(10))
-        except Exception:
-            pass
 
     async def stop(self):
         """Stop the ModBus proxy server"""
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
-        # Cancel periodic FD logging task if present
-        try:
-            if getattr(self, "_fd_log_task", None):
-                self._fd_log_task.cancel()
-                try:
-                    await self._fd_log_task
-                except Exception:
-                    pass
-                self._fd_log_task = None
-        except Exception:
-            pass
         await self.close()
 
     async def serve_forever(self):
