@@ -329,7 +329,6 @@ class Connection:  # pylint: disable=too-many-instance-attributes
             return
 
         try:
-            import struct  # pylint: disable=import-outside-toplevel
 
             # Parse MBAP header
             transaction_id, _, _, unit_id = struct.unpack(">HHHB", data[:7])
@@ -385,8 +384,6 @@ class Connection:  # pylint: disable=too-many-instance-attributes
             return
 
         try:
-            import struct  # pylint: disable=import-outside-toplevel
-
             # Parse RTU frame: [slave_id][function_code][data][crc_low][crc_high]
             slave_id = data[0]
             function_code = data[1]
@@ -549,93 +546,24 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         url = parse_url(modbus["url"])
         bind = parse_url(config["listen"]["bind"])
 
+        # Ensure base Connection init runs to set up logging; helpers will
+        # update `self.name` and `self.log` with more specific names.
+        super().__init__("ModBus", None, None)
+
         self.port = 502 if bind.port is None else bind.port
         self.timeout = modbus.get("timeout", None)
         self.connection_time = modbus.get("connection_time", 0)
         self.unit_id_remapping = config.get("unit_id_remapping") or {}
 
-        # Determine if it's RTU or TCP based on URL scheme
+        # Determine if it's RTU or TCP based on URL scheme and delegate
         if url.scheme == "rtu":
-            self.modbus_type = "rtu"
-            # Use the raw path from URL; ensure it is absolute
-            raw_path = url.path or ""
-            # If URL gives an empty path (unlikely), allow fallback from hostname
-            if not raw_path and url.hostname:
-                raw_path = url.hostname
-            # Ensure leading slash
-            if not raw_path.startswith("/"):
-                raw_path = "/" + raw_path
-            # Normalize and resolve symlinks if present
-            device_path = os.path.abspath(os.path.realpath(raw_path))
-            # Keep a user-friendly name for logs (basename)
-            device_name = os.path.basename(device_path)
-            super().__init__(f"ModBus(RTU:{device_name})", None, None)
-            self.device = device_path
-
-            self.baudrate = modbus.get("baudrate", 9600)
-            self.databits = modbus.get("databits", 8)
-            self.stopbits = modbus.get("stopbits", 1)
-            self.parity = modbus.get("parity", "N")
+            self._init_rtu(url, modbus)
         elif url.scheme == "rtutcp":
-            self.modbus_type = "rtutcp"
-            super().__init__(f"ModBus({url.hostname}:{url.port})", None, None)
-            self.modbus_host = url.hostname
-            self.modbus_port = url.port
+            self._init_rtutcp(url)
         elif url.scheme == "rtcpmrtu":
-            # Reverse TCP Modded RTU: TCP-based but with configurable MBAP
-            # protocol override, routing bytes before unit id and CRC appended.
-            # Also supports the reverse-TCP preflight flow (previously UDP
-            # mode) via configurable templates.
-            self.modbus_type = "rtcpmrtu"
-            super().__init__(f"ModBus({url.hostname}:{url.port})", None, None)
-            self.modbus_host_udp = url.hostname
-            self.modbus_port_udp = url.port
-            self.modbus_host = self.modbus_host_udp
-            self.modbus_port = self.modbus_port_udp
-            # Configurable MBAP/protocol override (accept int or hex string)
-            protocol_remap = modbus.get("protocol_remapping", modbus.get("mbap_protocol", None))
-            if isinstance(protocol_remap, str):
-                try:
-                    self.protocol_remapping = int(protocol_remap, 0)
-                except Exception:
-                    # support plain hex without 0x
-                    try:
-                        self.protocol_remapping = int(protocol_remap, 16)
-                    except Exception:
-                        self.protocol_remapping = None
-            else:
-                self.protocol_remapping = int(protocol_remap) if protocol_remap is not None else None
-            # Routing bytes (hex string expected). If not provided, default
-            # to empty bytes (no routing prefix inserted).
-            routing = modbus.get("routing_bytes", modbus.get("routing", None))
-            if routing:
-                try:
-                    self.routing_bytes = bytes.fromhex(routing)
-                except Exception:
-                    self.routing_bytes = b""
-            else:
-                self.routing_bytes = b""
-
-            # Read connect templates from rtcpmrtu_session_start_* keys
-            # These tell the device how to connect back to this proxy (master).
-            self.rtcpmrtu_session_start_request = modbus.get("rtcpmrtu_session_start_request")
-            self.rtcpmrtu_session_start_response = modbus.get(
-                "rtcpmrtu_session_start_response"
-            )
-            self.rtcpmrtu_session_start_timeout = modbus.get(
-                "rtcpmrtu_session_start_timeout", self.timeout or 5
-            )
-            # Optional explicit port to listen for reverse-TCP connections.
-            # If 0 or not provided, an ephemeral port is used.
-            try:
-                self.rtcp_listen_port = int(modbus.get("rtcp_listen_port", 0) or 0)
-            except Exception:
-                self.rtcp_listen_port = 0
+            self._init_rtcpmrtu(url, modbus)
         else:
-            self.modbus_type = "tcp"
-            super().__init__(f"ModBus({url.hostname}:{url.port})", None, None)
-            self.modbus_host = url.hostname
-            self.modbus_port = url.port
+            self._init_tcp(url)
 
         # Handle IPv6 support: "0" should bind to all interfaces (IPv4 + IPv6)
         if bind.hostname == "0":
@@ -645,6 +573,91 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
         self.server = None
         self._reverse_tcp_conn_future = None
         self.lock = asyncio.Lock()
+
+    def _init_rtu(self, url, modbus):
+        """Initialize RTU-specific settings."""
+        self.modbus_type = "rtu"
+        # Use the raw path from URL; ensure it is absolute
+        raw_path = url.path or ""
+        # If URL gives an empty path (unlikely), allow fallback from hostname
+        if not raw_path and url.hostname:
+            raw_path = url.hostname
+        # Ensure leading slash
+        if not raw_path.startswith("/"):
+            raw_path = "/" + raw_path
+        # Normalize and resolve symlinks if present
+        device_path = os.path.abspath(os.path.realpath(raw_path))
+        # Keep a user-friendly name for logs (basename)
+        device_name = os.path.basename(device_path)
+        self.name = f"ModBus(RTU:{device_name})"
+        self.log = log.getChild(self.name)
+        self.device = device_path
+
+        self.baudrate = modbus.get("baudrate", 9600)
+        self.databits = modbus.get("databits", 8)
+        self.stopbits = modbus.get("stopbits", 1)
+        self.parity = modbus.get("parity", "N")
+
+    def _init_rtutcp(self, url):
+        """Initialize RTU-over-TCP settings."""
+        self.modbus_type = "rtutcp"
+        self.name = f"ModBus({url.hostname}:{url.port})"
+        self.log = log.getChild(self.name)
+        self.modbus_host = url.hostname
+        self.modbus_port = url.port
+
+    def _init_rtcpmrtu(self, url, modbus):
+        """Initialize rtcpmrtu (reverse TCP + UDP preflight) settings."""
+        self.modbus_type = "rtcpmrtu"
+        self.name = f"ModBus({url.hostname}:{url.port})"
+        self.log = log.getChild(self.name)
+        self.modbus_host_udp = url.hostname
+        self.modbus_port_udp = url.port
+        self.modbus_host = self.modbus_host_udp
+        self.modbus_port = self.modbus_port_udp
+
+        # Configurable MBAP/protocol override (accept int or hex string)
+        protocol_remap = modbus.get("protocol_remapping", modbus.get("mbap_protocol", None))
+        if isinstance(protocol_remap, str):
+            try:
+                self.protocol_remapping = int(protocol_remap, 0)
+            except Exception:
+                # support plain hex without 0x
+                try:
+                    self.protocol_remapping = int(protocol_remap, 16)
+                except Exception:
+                    self.protocol_remapping = None
+        else:
+            self.protocol_remapping = int(protocol_remap) if protocol_remap is not None else None
+
+        # Routing bytes (hex string expected). If not provided, default to empty bytes
+        routing = modbus.get("routing_bytes", modbus.get("routing", None))
+        if routing:
+            try:
+                self.routing_bytes = bytes.fromhex(routing)
+            except Exception:
+                self.routing_bytes = b""
+        else:
+            self.routing_bytes = b""
+
+        # Read connect templates from rtcpmrtu_session_start_* keys
+        self.rtcpmrtu_session_start_request = modbus.get("rtcpmrtu_session_start_request")
+        self.rtcpmrtu_session_start_response = modbus.get("rtcpmrtu_session_start_response")
+        self.rtcpmrtu_session_start_timeout = modbus.get("rtcpmrtu_session_start_timeout", self.timeout or 5)
+
+        # Optional explicit port to listen for reverse-TCP connections.
+        try:
+            self.rtcp_listen_port = int(modbus.get("rtcp_listen_port", 0) or 0)
+        except Exception:
+            self.rtcp_listen_port = 0
+
+    def _init_tcp(self, url):
+        """Initialize TCP settings."""
+        self.modbus_type = "tcp"
+        self.name = f"ModBus({url.hostname}:{url.port})"
+        self.log = log.getChild(self.name)
+        self.modbus_host = url.hostname
+        self.modbus_port = url.port
 
     @property
     def address(self):
@@ -843,13 +856,11 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                         reverse_tcp_server.close()
                         try:
                             await reverse_tcp_server.wait_closed()
-                        except Exception:
+                        except Exception as e:
                             self.log.warning("Failed closing reverse_tcp_server socket: %r", e)
-                            pass
                         reverse_tcp_server = None
                 except Exception as e:
                     self.log.warning("Failed closing reverse_tcp_server B: %r", e)
-                    pass
                 reverse_tcp_server = None
 
                 # Close UDP transport if present
@@ -870,7 +881,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                         await udp_protocol.closed
                 except Exception as e:
                     self.log.warning("Failed closing udp_transport: %r", e)
-                    pass
                 udp_transport = None
                 udp_protocol = None
 
@@ -882,7 +892,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                         self._reverse_tcp_conn_future = None
                 except Exception as e:
                     self.log.warning("Failed closing _reverse_tcp_conn_future: %r", e)
-                    pass
 
             # Helper to render templates using the TCP listener address
             def render_template(tpl: str) -> str:
@@ -954,7 +963,6 @@ class ModBus(Connection):  # pylint: disable=too-many-instance-attributes
                     await self.writer.wait_closed()
             except Exception as e:
                 self.log.warning("Failed closing existing writer: %r", e)
-                pass
 
             # Set up vars for tcp session
             peer = writer.get_extra_info("peername")

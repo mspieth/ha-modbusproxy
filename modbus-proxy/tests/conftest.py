@@ -39,14 +39,14 @@ def bridge_factory():
     """Return a factory that creates a ModBus bridge with fresh dummy transport/protocol."""
 
     def _make(
-        udp_cfg=None,
+        cfg=None,
         url="rtcpmrtu://192.168.25.147:1502",
         timeout=1,
         bind="192.168.25.247:8999",
     ):
         mod_conf = {"url": url, "timeout": timeout}
-        if udp_cfg:
-            mod_conf.update(udp_cfg)
+        if cfg:
+            mod_conf.update(cfg)
         cfg = {"modbus": mod_conf, "listen": {"bind": bind}}
         bridge = ModBus(cfg)
         bridge.rtcpmrtu_protocol = DummyProtocol()

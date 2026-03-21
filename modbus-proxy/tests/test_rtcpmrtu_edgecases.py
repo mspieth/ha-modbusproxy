@@ -1,5 +1,6 @@
 """RTC-PM-RTU edge case tests."""
 
+# pylint: disable=protected-access
 import struct
 import pytest
 
@@ -12,7 +13,7 @@ async def test_rtcpmrtu_malformed_prefix_template(bridge_factory):
     bridge = bridge_factory()
     payload = b"\x01\x03\x02\x00\x2a"
     plen = len(payload)
-    udp_pkt = struct.pack(
+    _udp_pkt = struct.pack(
         f">HHHB{plen}sH",
         0x0002,
         0x0102,
@@ -40,7 +41,7 @@ async def test_rtcpmrtu_gateway_insertion_edge(bridge_factory):
     bridge = bridge_factory({})
     payload = b"\x01\x03\x02\x00\x2a"
     plen = len(payload)
-    udp_pkt = struct.pack(
+    _udp_pkt = struct.pack(
         f">HHHB{plen}sH",
         0x0004,
         0x0102,
@@ -50,8 +51,9 @@ async def test_rtcpmrtu_gateway_insertion_edge(bridge_factory):
         modbus_crc(payload),
     )
     bridge.rtcpmrtu_protocol.queue.put_nowait(
-        (udp_pkt, (bridge.modbus_host, bridge.modbus_port))
+        (_udp_pkt, (bridge.modbus_host, bridge.modbus_port))
     )
+
     mbap = b"\x00\x04\x00\x00\x00\x00"
     req = mbap  # no payload after MBAP
     tcp_req = bridge._transform_request(req, source_format="TCP")

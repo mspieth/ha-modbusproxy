@@ -19,7 +19,7 @@ async def test_rtcpmrtu_default_strip_mbap_and_gateway_and_response_reconstructi
 
     # Simulate device response: device returns unit, function, data
     udp_response_payload = b"\x11\x03\x02\x00\x2a"
-    udp_response = (
+    _udp_response = (
         b"\x00\x01\x01\x02\x00\x09\xff\x04" + udp_response_payload + b"\x12\x34"
     )
 
@@ -52,7 +52,7 @@ async def test_rtcpmrtu_prefix_and_crc_and_vars(bridge_factory):
 
     # Device echo response (payload only)
     udp_response_payload = b"\x01\x03\x00"
-    udp_response = (
+    _udp_response = (
         b"\xaa\xbb\x01\x02\x00\x07\xff\x04" + udp_response_payload + b"\x12\x34"
     )
     # Build the device-format request using the bridge transform
